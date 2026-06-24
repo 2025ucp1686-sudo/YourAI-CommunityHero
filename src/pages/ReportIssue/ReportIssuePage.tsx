@@ -2,13 +2,14 @@ import React, { useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
 import {
-  Upload, Camera, MapPin, AlertTriangle, Loader, CheckCircle,
-  X, Brain, Sparkles, Info, ChevronDown
+  Upload, Camera, MapPin, Loader, CheckCircle,
+  X, Brain, Sparkles, Info, AlertCircle
 } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { useAuth } from '@/contexts/AuthContext';
-import { analyzeIssueMedia, generateIssueSummary } from '@/services/geminiService';
+import { analyzeIssueMedia } from '@/services/geminiService';
 import { createIssue, uploadIssueMedia } from '@/services/issueService';
+import { isGeminiAvailable } from '@/lib/gemini';
 import toast from 'react-hot-toast';
 import type { IssueCategory, IssueSeverity, GeminiAnalysis, GeoLocation } from '@/types';
 
@@ -37,6 +38,7 @@ export default function ReportIssuePage() {
   const [files, setFiles] = useState<File[]>([]);
   const [previews, setPreviews] = useState<string[]>([]);
   const [geminiAnalysis, setGeminiAnalysis] = useState<GeminiAnalysis | null>(null);
+  const [aiAnalysisFailed, setAiAnalysisFailed] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [locating, setLocating] = useState(false);
@@ -49,31 +51,55 @@ export default function ReportIssuePage() {
     address: '',
   });
 
-  // File Drop
+  // ─── File Drop / Camera ───────────────────────────────────────────────────
   const onDrop = useCallback(async (accepted: File[]) => {
     if (accepted.length === 0) return;
     const newPreviews = accepted.map((f) => URL.createObjectURL(f));
     setFiles(accepted);
     setPreviews(newPreviews);
+    setGeminiAnalysis(null);
+    setAiAnalysisFailed(false);
 
-    // Auto-analyze with Gemini
-    if (accepted[0].type.startsWith('image/') || accepted[0].type.startsWith('video/')) {
-      setAnalyzing(true);
-      try {
-        const analysis = await analyzeIssueMedia(accepted[0]);
+    // Only attempt AI analysis for images/videos
+    const firstFile = accepted[0];
+    if (!firstFile.type.startsWith('image/') && !firstFile.type.startsWith('video/')) return;
+
+    if (!isGeminiAvailable) {
+      setAiAnalysisFailed(true);
+      return;
+    }
+
+    setAnalyzing(true);
+    try {
+      const analysis = await analyzeIssueMedia(firstFile);
+
+      // If confidence is 0, it means Gemini returned a fallback (error occurred)
+      if (analysis.confidence === 0) {
+        setAiAnalysisFailed(true);
+        toast('⚠️ AI analysis unavailable. Fill in details manually.', {
+          icon: '⚠️',
+          style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
+        });
+      } else {
         setGeminiAnalysis(analysis);
+        // Auto-fill form with AI suggestions (user can still change them)
         setForm((prev) => ({
           ...prev,
           category: analysis.category,
           severity: analysis.severity,
           description: prev.description || analysis.summary,
         }));
-        toast.success(`🤖 AI detected: ${analysis.category.replace('_', ' ')} (${Math.round(analysis.confidence * 100)}% confidence)`, { duration: 4000 });
-      } catch {
-        toast.error('AI analysis failed. Please fill details manually.');
-      } finally {
-        setAnalyzing(false);
+        toast.success(`🤖 AI detected: ${analysis.category.replace('_', ' ')} – ${Math.round(analysis.confidence * 100)}% confident`, { duration: 4000 });
       }
+    } catch {
+      setAiAnalysisFailed(true);
+      toast('⚠️ AI analysis unavailable. Submitting report without AI categorization.', {
+        icon: '⚠️',
+        style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
+        duration: 5000,
+      });
+    } finally {
+      setAnalyzing(false);
     }
   }, []);
 
@@ -84,17 +110,15 @@ export default function ReportIssuePage() {
     maxSize: 50 * 1024 * 1024,
   });
 
-  // Camera capture
   const cameraRef = useRef<HTMLInputElement>(null);
   const handleCamera = () => cameraRef.current?.click();
 
-  // GPS
+  // ─── GPS Location ─────────────────────────────────────────────────────────
   const detectLocation = () => {
     setLocating(true);
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
         const { latitude: lat, longitude: lng } = pos.coords;
-        // Reverse geocode using free API
         try {
           const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`);
           const data = await res.json();
@@ -104,54 +128,102 @@ export default function ReportIssuePage() {
           setForm((prev) => ({ ...prev, address }));
           toast.success('📍 Location detected!');
         } catch {
-          setLocation({ lat, lng, address: `${lat.toFixed(4)}, ${lng.toFixed(4)}` });
+          const address = `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+          setLocation({ lat, lng, address });
+          setForm((prev) => ({ ...prev, address }));
+          toast.success('📍 GPS coordinates captured!');
         }
         setLocating(false);
       },
-      () => { toast.error('Could not get location'); setLocating(false); }
+      (err) => {
+        console.error('GPS error:', err);
+        toast.error('Could not detect GPS. Enter address manually.');
+        setLocating(false);
+      },
+      { timeout: 10000 }
     );
   };
 
+  // Allow manual address as location fallback
+  const effectiveLocation: GeoLocation | null = location
+    ? { ...location, address: form.address || location.address }
+    : form.address.trim().length > 5
+    ? { lat: 0, lng: 0, address: form.address, city: 'Unknown' }
+    : null;
+
+  // ─── Submit ───────────────────────────────────────────────────────────────
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentUser || !userProfile) { toast.error('Please login first'); return; }
-    if (!location) { toast.error('Please detect your location'); return; }
-    if (!form.title.trim()) { toast.error('Please add a title'); return; }
+
+    if (!currentUser) {
+      toast.error('Please login first');
+      navigate('/login');
+      return;
+    }
+    if (!form.title.trim()) {
+      toast.error('Please add a title for the issue');
+      return;
+    }
+    if (!effectiveLocation) {
+      toast.error('Please detect your GPS location or enter an address');
+      return;
+    }
 
     setSubmitting(true);
+    const toastId = toast.loading('Submitting your report...');
+
     try {
+      // Step 1: Upload media (optional – skip if none)
       let mediaUrls: string[] = [];
       const mediaTypes: ('image' | 'video')[] = [];
 
       if (files.length > 0) {
-        toast.loading('Uploading media...');
-        mediaUrls = await uploadIssueMedia(files, currentUser.uid);
-        files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
-        toast.dismiss();
+        toast.loading('Uploading media files...', { id: toastId });
+        try {
+          mediaUrls = await uploadIssueMedia(files, currentUser.uid);
+          files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
+        } catch (uploadErr: any) {
+          console.warn('Media upload failed (non-blocking):', uploadErr?.message);
+          // Don't block submission if media upload fails
+          toast.loading('Media upload failed. Submitting report without media...', { id: toastId });
+          mediaUrls = [];
+        }
       }
 
+      // Step 2: Create Firestore document
+      toast.loading('Saving to database...', { id: toastId });
+
+      const reporterName = userProfile?.displayName || currentUser.email?.split('@')[0] || 'Anonymous';
+
       const issueId = await createIssue({
-        title: form.title,
-        description: form.description,
+        title: form.title.trim(),
+        description: form.description.trim() || `${form.category.replace('_', ' ')} issue reported at ${effectiveLocation.address}`,
         category: form.category,
         severity: form.severity,
-        location: { ...location, address: form.address || location.address },
+        location: effectiveLocation,
         mediaUrls,
         mediaTypes,
         reportedBy: currentUser.uid,
-        reporterName: userProfile.displayName,
-        reporterAvatar: userProfile.photoURL,
-        geminiAnalysis: geminiAnalysis || undefined,
+        reporterName,
+        reporterAvatar: userProfile?.photoURL,
+        // Only include geminiAnalysis if it's a real analysis (confidence > 0)
+        geminiAnalysis: geminiAnalysis && geminiAnalysis.confidence > 0 ? geminiAnalysis : undefined,
       });
 
-      toast.success('🎉 Issue reported! +50 points earned!');
+      toast.success('🎉 Issue reported successfully! +50 points earned!', { id: toastId, duration: 5000 });
       navigate(`/tracking/${issueId}`);
     } catch (err: any) {
-      toast.error(err.message || 'Failed to submit report');
+      console.error('Submit error:', err);
+      const msg = err?.code === 'permission-denied'
+        ? 'Permission denied. Please check Firestore rules in Firebase Console.'
+        : err?.message || 'Failed to submit report. Please try again.';
+      toast.error(msg, { id: toastId, duration: 6000 });
     } finally {
       setSubmitting(false);
     }
   };
+
+  const canSubmit = !submitting && !!form.title.trim() && !!effectiveLocation;
 
   return (
     <div className="page-container">
@@ -159,8 +231,20 @@ export default function ReportIssuePage() {
         {/* Header */}
         <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="mb-8">
           <h1 className="font-display font-bold text-3xl text-gradient mb-2">Report an Issue</h1>
-          <p className="text-gray-400">AI will automatically detect and categorize your report</p>
+          <p className="text-gray-400">
+            {isGeminiAvailable
+              ? 'AI will automatically detect and categorize your report'
+              : 'Fill in the details below to submit your civic issue report'}
+          </p>
         </motion.div>
+
+        {/* AI Unavailable Banner */}
+        {!isGeminiAvailable && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mb-4 glass-card rounded-xl p-3 border border-yellow-500/20 bg-yellow-500/5 flex items-center gap-2">
+            <AlertCircle size={14} className="text-yellow-400 flex-shrink-0" />
+            <p className="text-xs text-yellow-300">AI analysis unavailable. Add a valid Gemini API key to enable auto-categorization.</p>
+          </motion.div>
+        )}
 
         {/* Step Indicator */}
         <div className="flex items-center gap-2 mb-8">
@@ -170,7 +254,7 @@ export default function ReportIssuePage() {
                 <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold border ${step > s ? 'bg-neon-blue border-neon-blue text-white' : step === s ? 'border-neon-blue' : 'border-gray-700'}`}>
                   {step > s ? <CheckCircle size={14} /> : s}
                 </div>
-                <span className="text-xs hidden sm:block">{['Media', 'Details', 'Location'][s - 1]}</span>
+                <span className="text-xs hidden sm:block">{['Media', 'Details', 'Submit'][s - 1]}</span>
               </div>
               {s < 3 && <div className={`flex-1 h-px ${step > s ? 'bg-neon-blue' : 'bg-gray-700'}`} />}
             </React.Fragment>
@@ -178,8 +262,9 @@ export default function ReportIssuePage() {
         </div>
 
         <form onSubmit={handleSubmit}>
-          {/* Step 1: Media Upload */}
           <AnimatePresence mode="wait">
+
+            {/* ── Step 1: Media Upload ── */}
             {step === 1 && (
               <motion.div key="step1" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="space-y-4">
                 <div
@@ -208,8 +293,14 @@ export default function ReportIssuePage() {
                           )}
                           <button
                             type="button"
-                            onClick={(e) => { e.stopPropagation(); setFiles([]); setPreviews([]); setGeminiAnalysis(null); }}
-                            className="absolute top-1 right-1 bg-black/60 rounded-full p-1"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFiles([]);
+                              setPreviews([]);
+                              setGeminiAnalysis(null);
+                              setAiAnalysisFailed(false);
+                            }}
+                            className="absolute top-1 right-1 bg-black/60 rounded-full p-1 hover:bg-black/80"
                           >
                             <X size={12} />
                           </button>
@@ -220,28 +311,22 @@ export default function ReportIssuePage() {
                     <>
                       <Upload size={40} className="mx-auto text-gray-600 mb-4" />
                       <p className="text-white font-medium mb-1">Drop images or videos here</p>
-                      <p className="text-gray-500 text-sm">or click to browse • Max 50MB</p>
+                      <p className="text-gray-500 text-sm">or click to browse • Max 50MB • Optional</p>
                     </>
                   )}
                 </div>
 
                 {/* Camera button */}
-                <button
-                  type="button"
-                  onClick={handleCamera}
-                  className="w-full btn-secondary flex items-center justify-center gap-2 py-3 rounded-xl"
-                >
+                <button type="button" onClick={handleCamera} className="w-full btn-secondary flex items-center justify-center gap-2 py-3 rounded-xl">
                   <Camera size={18} /> Capture from Camera
                 </button>
 
-                {/* Gemini Analysis Result */}
+                {/* AI Analysis Status */}
                 <AnimatePresence>
                   {analyzing && (
-                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="glass-card rounded-xl p-4 border border-neon-purple/20">
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="glass-card rounded-xl p-4 border border-neon-purple/20">
                       <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 rounded-lg bg-neon-purple/20 flex items-center justify-center">
-                          <Brain size={16} className="text-neon-purple animate-pulse" />
-                        </div>
+                        <Brain size={16} className="text-neon-purple animate-pulse" />
                         <div>
                           <p className="text-sm font-medium text-white">Gemini AI Analyzing...</p>
                           <p className="text-xs text-gray-500">Detecting issue type and severity</p>
@@ -250,7 +335,14 @@ export default function ReportIssuePage() {
                     </motion.div>
                   )}
 
-                  {geminiAnalysis && !analyzing && (
+                  {aiAnalysisFailed && !analyzing && (
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="glass-card rounded-xl p-3 border border-yellow-500/20 bg-yellow-500/5 flex items-center gap-2">
+                      <AlertCircle size={14} className="text-yellow-400 flex-shrink-0" />
+                      <p className="text-xs text-yellow-300">AI analysis unavailable. Submitting report without AI categorization.</p>
+                    </motion.div>
+                  )}
+
+                  {geminiAnalysis && !analyzing && geminiAnalysis.confidence > 0 && (
                     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="glass-card rounded-xl p-4 border border-neon-blue/20">
                       <div className="flex items-center gap-2 mb-3">
                         <Sparkles size={16} className="text-neon-blue" />
@@ -281,12 +373,12 @@ export default function ReportIssuePage() {
                 </AnimatePresence>
 
                 <button type="button" onClick={() => setStep(2)} className="btn-primary w-full py-3 text-white font-bold rounded-xl">
-                  Continue →
+                  Continue → {files.length === 0 && <span className="text-xs opacity-70 ml-1">(without media)</span>}
                 </button>
               </motion.div>
             )}
 
-            {/* Step 2: Details */}
+            {/* ── Step 2: Details ── */}
             {step === 2 && (
               <motion.div key="step2" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="space-y-5">
                 <div>
@@ -294,7 +386,7 @@ export default function ReportIssuePage() {
                   <input
                     value={form.title}
                     onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))}
-                    placeholder="Brief title of the issue"
+                    placeholder="Brief title e.g. 'Large pothole on Main Street'"
                     className="input-field"
                     required
                   />
@@ -352,14 +444,21 @@ export default function ReportIssuePage() {
                   <button type="button" onClick={() => setStep(1)} className="btn-secondary flex-1 py-3 rounded-xl">
                     ← Back
                   </button>
-                  <button type="button" onClick={() => setStep(3)} className="btn-primary flex-1 py-3 text-white font-bold rounded-xl">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!form.title.trim()) { toast.error('Please add a title'); return; }
+                      setStep(3);
+                    }}
+                    className="btn-primary flex-1 py-3 text-white font-bold rounded-xl"
+                  >
                     Continue →
                   </button>
                 </div>
               </motion.div>
             )}
 
-            {/* Step 3: Location & Submit */}
+            {/* ── Step 3: Location & Submit ── */}
             {step === 3 && (
               <motion.div key="step3" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} className="space-y-5">
                 <div>
@@ -370,27 +469,40 @@ export default function ReportIssuePage() {
                     disabled={locating}
                     className="w-full btn-secondary flex items-center justify-center gap-2 py-3 rounded-xl mb-3"
                   >
-                    {locating ? <><div className="spinner w-4 h-4" /> Detecting...</> : <><MapPin size={16} /> Auto-Detect GPS Location</>}
+                    {locating ? <><div className="spinner w-4 h-4" /> Detecting GPS...</> : <><MapPin size={16} /> Auto-Detect GPS Location</>}
                   </button>
                   <input
                     value={form.address}
                     onChange={(e) => setForm((p) => ({ ...p, address: e.target.value }))}
-                    placeholder="Or enter address manually"
+                    placeholder="Or type your address manually"
                     className="input-field"
                   />
                   {location && (
                     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mt-2 flex items-center gap-2 text-xs text-green-400">
                       <CheckCircle size={12} />
-                      Location detected: {location.lat.toFixed(4)}, {location.lng.toFixed(4)}
+                      GPS: {location.lat.toFixed(4)}, {location.lng.toFixed(4)}
                     </motion.div>
+                  )}
+                  {!location && form.address.trim().length > 5 && (
+                    <p className="text-xs text-blue-400 mt-1 flex items-center gap-1">
+                      <CheckCircle size={10} /> Using entered address as location
+                    </p>
+                  )}
+                  {!effectiveLocation && (
+                    <p className="text-xs text-red-400 mt-1 flex items-center gap-1">
+                      <AlertCircle size={10} /> Location required to submit
+                    </p>
                   )}
                 </div>
 
-                {/* Summary */}
+                {/* Report Summary */}
                 <div className="glass-card rounded-xl p-4 border border-white/10">
                   <div className="flex items-center gap-2 mb-3">
                     <Info size={14} className="text-neon-blue" />
                     <span className="text-sm font-semibold">Report Summary</span>
+                    {geminiAnalysis && geminiAnalysis.confidence > 0 && (
+                      <span className="ml-auto badge-blue text-xs flex items-center gap-1"><Sparkles size={10} /> AI Enhanced</span>
+                    )}
                   </div>
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
@@ -407,27 +519,36 @@ export default function ReportIssuePage() {
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-500">Media</span>
-                      <span className="text-white">{files.length} file(s)</span>
+                      <span className="text-white">{files.length} file{files.length !== 1 ? 's' : ''}</span>
                     </div>
-                    <div className="flex justify-between">
-                      <span className="text-gray-500">Reward</span>
-                      <span className="text-neon-green font-bold">+50 points</span>
+                    <div className="flex justify-between border-t border-white/5 pt-2">
+                      <span className="text-gray-500">Points Earned</span>
+                      <span className="text-neon-green font-bold">+50 points 🎉</span>
                     </div>
                   </div>
                 </div>
 
                 <div className="flex gap-3">
-                  <button type="button" onClick={() => setStep(2)} className="btn-secondary flex-1 py-3 rounded-xl">
+                  <button type="button" onClick={() => setStep(2)} disabled={submitting} className="btn-secondary flex-1 py-3 rounded-xl">
                     ← Back
                   </button>
                   <button
                     type="submit"
-                    disabled={submitting || !location || !form.title}
+                    disabled={!canSubmit}
                     className="btn-primary flex-1 py-3 text-white font-bold rounded-xl flex items-center justify-center gap-2"
                   >
-                    {submitting ? <><div className="spinner w-5 h-5" /> Submitting...</> : <>Submit Report 🚀</>}
+                    {submitting
+                      ? <><div className="spinner w-5 h-5" /> Submitting...</>
+                      : <>Submit Report 🚀</>
+                    }
                   </button>
                 </div>
+
+                {!currentUser && (
+                  <p className="text-center text-xs text-yellow-400">
+                    ⚠️ You must be <a href="/login" className="underline">logged in</a> to submit a report.
+                  </p>
+                )}
               </motion.div>
             )}
           </AnimatePresence>
