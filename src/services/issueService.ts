@@ -48,17 +48,35 @@ export async function createIssue(data: {
   reporterAvatar?: string;
   geminiAnalysis?: GeminiAnalysis;
 }): Promise<string> {
-  const issueRef = await addDoc(collection(db, ISSUES_COLLECTION), {
-    ...data,
-    status: 'reported' as IssueStatus,
-    verificationCount: 0,
-    upvoteCount: 0,
-    statusHistory: [{ status: 'reported', timestamp: serverTimestamp(), note: 'Issue reported by citizen' }],
-    comments: [],
-    createdAt: serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  });
-  return issueRef.id;
+  console.log('[issueService] Writing report to Firestore, collection:', ISSUES_COLLECTION);
+  console.log('[issueService] Report data:', { title: data.title, category: data.category, severity: data.severity, reportedBy: data.reportedBy });
+
+  try {
+    // NOTE: serverTimestamp() CANNOT be used inside arrays in Firestore.
+    // Use ISO string for statusHistory timestamps.
+    const issueRef = await addDoc(collection(db, ISSUES_COLLECTION), {
+      ...data,
+      // Strip undefined values that Firestore rejects
+      reporterAvatar: data.reporterAvatar || null,
+      geminiAnalysis: data.geminiAnalysis || null,
+      status: 'reported' as IssueStatus,
+      verificationCount: 0,
+      upvoteCount: 0,
+      statusHistory: [{
+        status: 'reported',
+        timestamp: new Date().toISOString(), // ← ISO string, NOT serverTimestamp() (not allowed in arrays)
+        note: 'Issue reported by citizen',
+      }],
+      comments: [],
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    console.log('[issueService] Firestore write success! Document ID:', issueRef.id);
+    return issueRef.id;
+  } catch (err: any) {
+    console.error('[issueService] Firestore write FAILED:', err?.code, err?.message, err);
+    throw err;
+  }
 }
 
 // ─── Get issue by ID ──────────────────────────────────────────────────────────

@@ -151,73 +151,109 @@ export default function ReportIssuePage() {
     ? { lat: 0, lng: 0, address: form.address, city: 'Unknown' }
     : null;
 
-  // ─── Submit ───────────────────────────────────────────────────────────────
+  // ─── Submit ───────────────────────────────────────────────────────────────────────
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    console.log('[ReportIssue] Submit started');
 
+    // ── Validation ─────────────────────────────────────────────────────
     if (!currentUser) {
+      console.warn('[ReportIssue] Blocked: no currentUser');
       toast.error('Please login first');
       navigate('/login');
       return;
     }
+    console.log('[ReportIssue] User:', currentUser.uid, currentUser.email);
+
     if (!form.title.trim()) {
+      console.warn('[ReportIssue] Blocked: empty title');
       toast.error('Please add a title for the issue');
       return;
     }
-    if (!effectiveLocation) {
-      toast.error('Please detect your GPS location or enter an address');
+
+    // Compute effective location inline (not from stale render-time value)
+    const currentEffectiveLocation: GeoLocation | null = location
+      ? { ...location, address: form.address || location.address }
+      : form.address.trim().length > 3
+      ? { lat: 0, lng: 0, address: form.address.trim(), city: 'Unknown' }
+      : null;
+
+    if (!currentEffectiveLocation) {
+      console.warn('[ReportIssue] Blocked: no location');
+      toast.error('Please detect GPS location or enter an address (min 4 characters)');
       return;
     }
+    console.log('[ReportIssue] Location:', currentEffectiveLocation);
 
     setSubmitting(true);
     const toastId = toast.loading('Submitting your report...');
 
-    try {
-      // Step 1: Upload media (optional – skip if none)
-      let mediaUrls: string[] = [];
-      const mediaTypes: ('image' | 'video')[] = [];
+    // ── Step 1: Media upload (OPTIONAL — never blocks Firestore write) ─────────
+    let mediaUrls: string[] = [];
+    const mediaTypes: ('image' | 'video')[] = [];
 
-      if (files.length > 0) {
-        toast.loading('Uploading media files...', { id: toastId });
-        try {
-          mediaUrls = await uploadIssueMedia(files, currentUser.uid);
-          files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
-        } catch (uploadErr: any) {
-          console.warn('Media upload failed (non-blocking):', uploadErr?.message);
-          // Don't block submission if media upload fails
-          toast.loading('Media upload failed. Submitting report without media...', { id: toastId });
-          mediaUrls = [];
-        }
+    if (files.length > 0) {
+      console.log('[ReportIssue] Uploading', files.length, 'media file(s)...');
+      toast.loading('Uploading media...', { id: toastId });
+      try {
+        mediaUrls = await uploadIssueMedia(files, currentUser.uid);
+        files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
+        console.log('[ReportIssue] Media uploaded:', mediaUrls);
+      } catch (uploadErr: any) {
+        console.warn('[ReportIssue] Media upload failed (non-blocking):', uploadErr?.message);
+        mediaUrls = []; // continue without media
       }
+    } else {
+      console.log('[ReportIssue] No media files — skipping upload');
+    }
 
-      // Step 2: Create Firestore document
-      toast.loading('Saving to database...', { id: toastId });
+    // ── Step 2: Firestore write (ALWAYS happens regardless of above failures) ─
+    console.log('[ReportIssue] Writing report to Firestore...');
+    toast.loading('Saving report to database...', { id: toastId });
 
-      const reporterName = userProfile?.displayName || currentUser.email?.split('@')[0] || 'Anonymous';
+    try {
+      const reporterName =
+        userProfile?.displayName ||
+        currentUser.displayName ||
+        currentUser.email?.split('@')[0] ||
+        'Anonymous';
 
-      const issueId = await createIssue({
+      const issueData = {
         title: form.title.trim(),
-        description: form.description.trim() || `${form.category.replace('_', ' ')} issue reported at ${effectiveLocation.address}`,
+        description:
+          form.description.trim() ||
+          `${form.category.replace('_', ' ')} issue reported at ${currentEffectiveLocation.address}`,
         category: form.category,
         severity: form.severity,
-        location: effectiveLocation,
+        location: currentEffectiveLocation,
         mediaUrls,
         mediaTypes,
         reportedBy: currentUser.uid,
         reporterName,
-        reporterAvatar: userProfile?.photoURL,
-        // Only include geminiAnalysis if it's a real analysis (confidence > 0)
-        geminiAnalysis: geminiAnalysis && geminiAnalysis.confidence > 0 ? geminiAnalysis : undefined,
-      });
+        reporterAvatar: userProfile?.photoURL || currentUser.photoURL || undefined,
+        geminiAnalysis:
+          geminiAnalysis && geminiAnalysis.confidence > 0 ? geminiAnalysis : undefined,
+      };
 
-      toast.success('🎉 Issue reported successfully! +50 points earned!', { id: toastId, duration: 5000 });
+      console.log('[ReportIssue] issueData ready:', issueData.title, issueData.category);
+
+      const issueId = await createIssue(issueData);
+
+      console.log('[ReportIssue] Firestore write success! issueId:', issueId);
+      toast.success('🎉 Report submitted successfully! +50 points earned!', {
+        id: toastId,
+        duration: 5000,
+      });
       navigate(`/tracking/${issueId}`);
     } catch (err: any) {
-      console.error('Submit error:', err);
-      const msg = err?.code === 'permission-denied'
-        ? 'Permission denied. Please check Firestore rules in Firebase Console.'
-        : err?.message || 'Failed to submit report. Please try again.';
-      toast.error(msg, { id: toastId, duration: 6000 });
+      console.error('[ReportIssue] Firestore write failed:', err?.code, err?.message, err);
+      const msg =
+        err?.code === 'permission-denied'
+          ? 'Firestore permission denied. Go to Firebase Console → Firestore → Rules and allow writes.'
+          : err?.code === 'unavailable'
+          ? 'Firestore is offline. Check your internet connection.'
+          : err?.message || 'Failed to save report. Please try again.';
+      toast.error(msg, { id: toastId, duration: 8000 });
     } finally {
       setSubmitting(false);
     }
