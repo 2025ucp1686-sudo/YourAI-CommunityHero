@@ -1,6 +1,38 @@
 import { geminiVision, geminiPro, isGeminiAvailable } from '@/lib/gemini';
 import type { GeminiAnalysis, IssueCategory, IssueSeverity, PredictiveInsight, Issue } from '@/types';
 
+// ─── Session-level rate-limit flag ───────────────────────────────────────────────
+// If Gemini returns 429 (Too Many Requests), we disable it for the entire
+// browser session so we don't spam the API or console with repeated errors.
+let rateLimitHit = false;
+
+function isGeminiReady(): boolean {
+  if (!isGeminiAvailable) return false;
+  if (rateLimitHit) return false;
+  return true;
+}
+
+function handleGeminiError(error: any, context: string): void {
+  const msg = error?.message || String(error);
+  const status = error?.status || error?.code;
+
+  if (status === 429 || msg.includes('429') || msg.includes('Too Many Requests') || msg.includes('quota')) {
+    if (!rateLimitHit) {
+      rateLimitHit = true;
+      console.warn(`[Gemini] 429 Too Many Requests in ${context}. AI analysis disabled for this session. Reset by refreshing the page.`);
+    }
+    return;
+  }
+
+  if (msg.includes('not found') || msg.includes('404')) {
+    console.warn(`[Gemini] Model not found in ${context}. Check model name in gemini.ts.`);
+    return;
+  }
+
+  // Only log once per unique error message to avoid spam
+  console.warn(`[Gemini] Error in ${context}:`, msg.substring(0, 120));
+}
+
 // ─── Default fallback analysis (used when Gemini is unavailable) ──────────────
 const DEFAULT_ANALYSIS: GeminiAnalysis = {
   category: 'other' as IssueCategory,
@@ -42,11 +74,7 @@ function parseJsonFromText<T>(text: string, fallback: T): T {
 
 // ─── Analyze uploaded image/video for civic issues ────────────────────────────
 export async function analyzeIssueMedia(file: File): Promise<GeminiAnalysis> {
-  // Return default immediately if Gemini is not configured
-  if (!isGeminiAvailable || !geminiVision) {
-    console.warn('Gemini not available – skipping vision analysis');
-    return DEFAULT_ANALYSIS;
-  }
+  if (!isGeminiReady() || !geminiVision) return DEFAULT_ANALYSIS;
 
   try {
     const mediaPart = await fileToGenerativePart(file);
@@ -72,7 +100,6 @@ Severity guide: low=minor inconvenience, medium=affects daily life, high=safety 
     const text = result.response.text();
     const analysis = parseJsonFromText<GeminiAnalysis>(text, DEFAULT_ANALYSIS);
 
-    // Validate required fields
     const validCategories = ['pothole', 'water_leakage', 'garbage', 'streetlight', 'drainage', 'road_damage', 'infrastructure', 'other'];
     const validSeverities = ['low', 'medium', 'high', 'critical'];
     if (!validCategories.includes(analysis.category)) analysis.category = 'other';
@@ -81,10 +108,11 @@ Severity guide: low=minor inconvenience, medium=affects daily life, high=safety 
 
     return analysis;
   } catch (error: any) {
-    console.warn('Gemini vision analysis failed (non-blocking):', error?.message || error);
+    handleGeminiError(error, 'analyzeIssueMedia');
     return DEFAULT_ANALYSIS;
   }
 }
+
 
 // ─── Generate detailed issue summary ─────────────────────────────────────────
 export async function generateIssueSummary(
@@ -94,13 +122,11 @@ export async function generateIssueSummary(
   severity: IssueSeverity,
   location: string
 ): Promise<string> {
-  if (!isGeminiAvailable || !geminiPro) {
-    return `${title} - A ${severity} severity ${category.replace('_', ' ')} issue reported at ${location}.`;
-  }
+  const fallbackMsg = `${title} - A ${severity} severity ${category.replace('_', ' ')} issue reported at ${location}.`;
+  if (!isGeminiReady() || !geminiPro) return fallbackMsg;
 
   const prompt = `Generate a concise 2-sentence professional summary for this civic issue report:
 - Title: ${title}
-- Description: ${description}
 - Category: ${category.replace('_', ' ')}
 - Severity: ${severity}
 - Location: ${location}
@@ -110,18 +136,19 @@ Keep it factual and under 80 words. No bullet points, just plain text.`;
   try {
     const result = await geminiPro.generateContent(prompt);
     return result.response.text().trim();
-  } catch (error) {
-    console.warn('Gemini summary failed (non-blocking):', error);
-    return `${title} - A ${severity} severity ${category.replace('_', ' ')} issue has been reported at ${location}. Immediate attention required.`;
+  } catch (error: any) {
+    handleGeminiError(error, 'generateIssueSummary');
+    return fallbackMsg;
   }
 }
+
 
 // ─── Detect duplicate issues ──────────────────────────────────────────────────
 export async function detectDuplicates(
   newIssue: { title: string; description: string; category: string; location: string },
   existingIssues: Issue[]
 ): Promise<{ isDuplicate: boolean; duplicateId?: string; confidence: number }> {
-  if (!isGeminiAvailable || !geminiPro || existingIssues.length === 0) {
+  if (!isGeminiReady() || !geminiPro || existingIssues.length === 0) {
     return { isDuplicate: false, confidence: 0 };
   }
 
@@ -142,10 +169,12 @@ Respond ONLY with JSON: {"isDuplicate": false, "duplicateId": null, "confidence"
   try {
     const result = await geminiPro.generateContent(prompt);
     return parseJsonFromText(result.response.text(), { isDuplicate: false, confidence: 0 });
-  } catch {
+  } catch (error: any) {
+    handleGeminiError(error, 'detectDuplicates');
     return { isDuplicate: false, confidence: 0 };
   }
 }
+
 
 // ─── Generate predictive insights ─────────────────────────────────────────────
 export async function generatePredictiveInsights(analyticsData: {
@@ -171,7 +200,7 @@ export async function generatePredictiveInsights(analyticsData: {
     confidence: 0.75,
   };
 
-  if (!isGeminiAvailable || !geminiPro) return fallback;
+  if (!isGeminiReady() || !geminiPro) return fallback;
 
   const prompt = `Analyze this community issue data and generate predictive insights.
 
@@ -192,10 +221,12 @@ Respond ONLY with JSON:
     const result = await geminiPro.generateContent(prompt);
     const parsed = parseJsonFromText<Partial<PredictiveInsight>>(result.response.text(), {});
     return { ...fallback, ...parsed, id: `insight-${Date.now()}`, generatedAt: new Date() };
-  } catch {
+  } catch (error: any) {
+    handleGeminiError(error, 'generatePredictiveInsights');
     return fallback;
   }
 }
+
 
 // ─── Recommend authority (local lookup – no Gemini needed) ────────────────────
 export async function recommendAuthority(category: IssueCategory, _location: string): Promise<string> {
@@ -231,7 +262,7 @@ export async function categorizeFromText(title: string, description: string): Pr
   tags: string[];
 }> {
   const fallback = { category: 'other' as IssueCategory, severity: 'medium' as IssueSeverity, tags: [] };
-  if (!isGeminiAvailable || !geminiPro) return fallback;
+  if (!isGeminiReady() || !geminiPro) return fallback;
 
   const prompt = `Classify this civic issue:
 Title: ${title}
@@ -243,7 +274,9 @@ Respond ONLY with JSON:
   try {
     const result = await geminiPro.generateContent(prompt);
     return parseJsonFromText(result.response.text(), fallback);
-  } catch {
+  } catch (error: any) {
+    handleGeminiError(error, 'categorizeFromText');
     return fallback;
   }
 }
+
