@@ -22,17 +22,34 @@ import { v4 as uuidv4 } from 'uuid';
 
 const ISSUES_COLLECTION = 'issues';
 
-// ─── Upload media files ───────────────────────────────────────────────────────
+// ─── Upload media files (with 10s timeout per file) ────────────────────────────
 export async function uploadIssueMedia(files: File[], userId: string): Promise<string[]> {
   const urls: string[] = [];
+
   for (const file of files) {
-    const fileRef = ref(storage, `issues/${userId}/${uuidv4()}-${file.name}`);
-    await uploadBytes(fileRef, file);
-    const url = await getDownloadURL(fileRef);
-    urls.push(url);
+    try {
+      const fileRef = ref(storage, `issues/${userId}/${uuidv4()}-${file.name}`);
+
+      // Wrap each upload in a 10-second timeout using Promise.race
+      // This prevents the promise from hanging forever on CORS/network failures
+      const uploadTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Upload timeout after 10s')), 10000)
+      );
+
+      const uploadPromise = uploadBytes(fileRef, file).then(() => getDownloadURL(fileRef));
+
+      const url = await Promise.race([uploadPromise, uploadTimeout]);
+      urls.push(url);
+      console.log('[issueService] Uploaded file:', file.name, '->', url.substring(0, 60) + '...');
+    } catch (err: any) {
+      // Log but never throw — let submission continue without this file
+      console.warn('[issueService] File upload failed (non-blocking):', file.name, err?.message || err);
+    }
   }
-  return urls;
+
+  return urls; // may be empty if all uploads failed — that's fine
 }
+
 
 // ─── Create new issue ─────────────────────────────────────────────────────────
 export async function createIssue(data: {

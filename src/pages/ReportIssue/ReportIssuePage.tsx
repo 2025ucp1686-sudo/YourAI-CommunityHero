@@ -188,20 +188,37 @@ export default function ReportIssuePage() {
     setSubmitting(true);
     const toastId = toast.loading('Submitting your report...');
 
-    // ── Step 1: Media upload (OPTIONAL — never blocks Firestore write) ─────────
+    // ── Step 1: Media upload (OPTIONAL — NEVER blocks Firestore write) ─────────
     let mediaUrls: string[] = [];
     const mediaTypes: ('image' | 'video')[] = [];
 
     if (files.length > 0) {
       console.log('[ReportIssue] Uploading', files.length, 'media file(s)...');
-      toast.loading('Uploading media...', { id: toastId });
-      try {
-        mediaUrls = await uploadIssueMedia(files, currentUser.uid);
-        files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
-        console.log('[ReportIssue] Media uploaded:', mediaUrls);
-      } catch (uploadErr: any) {
-        console.warn('[ReportIssue] Media upload failed (non-blocking):', uploadErr?.message);
-        mediaUrls = []; // continue without media
+      toast.loading('Uploading media... (max 10s)', { id: toastId });
+
+      // uploadIssueMedia now NEVER throws — it catches failures internally
+      // and returns only successfully uploaded URLs (may be empty on CORS failure)
+      mediaUrls = await uploadIssueMedia(files, currentUser.uid);
+      files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
+
+      if (mediaUrls.length === 0) {
+        // All uploads failed (CORS, timeout, permission)
+        console.warn('[ReportIssue] Media upload failed for all files — continuing without media');
+        toast('⚠️ Image upload failed. Submitting report without image.', {
+          icon: '⚠️',
+          duration: 5000,
+          style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
+        });
+      } else if (mediaUrls.length < files.length) {
+        // Partial failure
+        console.warn('[ReportIssue] Some files failed to upload:', files.length - mediaUrls.length, 'failed');
+        toast('⚠️ Some images failed to upload. Report will include successfully uploaded ones.', {
+          icon: '⚠️',
+          duration: 4000,
+          style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
+        });
+      } else {
+        console.log('[ReportIssue] All media uploaded successfully:', mediaUrls.length, 'file(s)');
       }
     } else {
       console.log('[ReportIssue] No media files — skipping upload');
