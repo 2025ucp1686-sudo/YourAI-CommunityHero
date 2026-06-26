@@ -15,10 +15,10 @@ const safetySettings = [
   { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
 ];
 
-// Text model – gemini-2.0-flash is the current stable model
+// Text model – gemini-2.5-flash is the current stable model
 export const geminiPro = genAI
   ? genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       safetySettings,
       generationConfig: {
         temperature: 0.7,
@@ -29,10 +29,10 @@ export const geminiPro = genAI
     })
   : null;
 
-// Vision model – same model handles vision in Gemini 2.0
+// Vision model – same model handles vision in Gemini 2.5
 export const geminiVision = genAI
   ? genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       safetySettings,
       generationConfig: {
         temperature: 0.4,

@@ -76,7 +76,7 @@ export default function ReportIssuePage() {
       // If confidence is 0, it means Gemini returned a fallback (error occurred)
       if (analysis.confidence === 0) {
         setAiAnalysisFailed(true);
-        toast('⚠️ AI analysis unavailable. Fill in details manually.', {
+        toast('AI analysis unavailable. Please fill details manually.', {
           icon: '⚠️',
           style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
         });
@@ -93,7 +93,7 @@ export default function ReportIssuePage() {
       }
     } catch {
       setAiAnalysisFailed(true);
-      toast('⚠️ AI analysis unavailable. Submitting report without AI categorization.', {
+      toast('AI analysis unavailable. Please fill details manually.', {
         icon: '⚠️',
         style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
         duration: 5000,
@@ -172,63 +172,60 @@ export default function ReportIssuePage() {
     }
 
     // Compute effective location inline (not from stale render-time value)
-    const currentEffectiveLocation: GeoLocation | null = location
-      ? { ...location, address: form.address || location.address }
-      : form.address.trim().length > 3
-      ? { lat: 0, lng: 0, address: form.address.trim(), city: 'Unknown' }
-      : null;
-
-    if (!currentEffectiveLocation) {
-      console.warn('[ReportIssue] Blocked: no location');
-      toast.error('Please detect GPS location or enter an address (min 4 characters)');
-      return;
-    }
-    console.log('[ReportIssue] Location:', currentEffectiveLocation);
-
     setSubmitting(true);
     const toastId = toast.loading('Submitting your report...');
 
-    // ── Step 1: Media upload (OPTIONAL — NEVER blocks Firestore write) ─────────
-    let mediaUrls: string[] = [];
-    const mediaTypes: ('image' | 'video')[] = [];
-
-    if (files.length > 0) {
-      console.log('[ReportIssue] Uploading', files.length, 'media file(s)...');
-      toast.loading('Uploading media... (max 10s)', { id: toastId });
-
-      // uploadIssueMedia now NEVER throws — it catches failures internally
-      // and returns only successfully uploaded URLs (may be empty on CORS failure)
-      mediaUrls = await uploadIssueMedia(files, currentUser.uid);
-      files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
-
-      if (mediaUrls.length === 0) {
-        // All uploads failed (CORS, timeout, permission)
-        console.warn('[ReportIssue] Media upload failed for all files — continuing without media');
-        toast('⚠️ Image upload failed. Submitting report without image.', {
-          icon: '⚠️',
-          duration: 5000,
-          style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
-        });
-      } else if (mediaUrls.length < files.length) {
-        // Partial failure
-        console.warn('[ReportIssue] Some files failed to upload:', files.length - mediaUrls.length, 'failed');
-        toast('⚠️ Some images failed to upload. Report will include successfully uploaded ones.', {
-          icon: '⚠️',
-          duration: 4000,
-          style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
-        });
-      } else {
-        console.log('[ReportIssue] All media uploaded successfully:', mediaUrls.length, 'file(s)');
-      }
-    } else {
-      console.log('[ReportIssue] No media files — skipping upload');
-    }
-
-    // ── Step 2: Firestore write (ALWAYS happens regardless of above failures) ─
-    console.log('[ReportIssue] Writing report to Firestore...');
-    toast.loading('Saving report to database...', { id: toastId });
-
     try {
+      // ── Step 1: Media upload (OPTIONAL — NEVER blocks Firestore write) ─────────
+      let mediaUrls: string[] = [];
+      const mediaTypes: ('image' | 'video')[] = [];
+
+      if (files.length > 0) {
+        console.log('[ReportIssue] Uploading', files.length, 'media file(s)...');
+        toast.loading('Uploading media... (max 10s)', { id: toastId });
+
+        // uploadIssueMedia now NEVER throws — it catches failures internally
+        // and returns only successfully uploaded URLs (may be empty on CORS failure)
+        mediaUrls = await uploadIssueMedia(files, currentUser.uid);
+        files.forEach((f) => mediaTypes.push(f.type.startsWith('video/') ? 'video' : 'image'));
+
+        if (mediaUrls.length === 0) {
+          // All uploads failed (CORS, timeout, permission)
+          console.warn('[ReportIssue] Media upload failed for all files — continuing without media');
+          toast('Image upload failed. Report submitted without image.', {
+            icon: '⚠️',
+            duration: 5000,
+            style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
+          });
+        } else if (mediaUrls.length < files.length) {
+          // Partial failure
+          console.warn('[ReportIssue] Some files failed to upload:', files.length - mediaUrls.length, 'failed');
+          toast('⚠️ Some images failed to upload. Report will include successfully uploaded ones.', {
+            icon: '⚠️',
+            duration: 4000,
+            style: { background: '#1a1a2e', color: '#f59e0b', border: '1px solid rgba(245,158,11,0.3)' },
+          });
+        } else {
+          console.log('[ReportIssue] All media uploaded successfully:', mediaUrls.length, 'file(s)');
+        }
+      } else {
+        console.log('[ReportIssue] No media files — skipping upload');
+      }
+
+      // ── Step 2: Firestore write (ALWAYS happens regardless of above failures) ─
+      console.log('[ReportIssue] Writing report to Firestore...');
+      toast.loading('Saving report to database...', { id: toastId });
+
+      const currentEffectiveLocation: GeoLocation | null = location
+        ? { ...location, address: form.address || location.address }
+        : form.address.trim().length > 3
+        ? { lat: 0, lng: 0, address: form.address.trim(), city: 'Unknown' }
+        : null;
+
+      if (!currentEffectiveLocation) {
+        throw new Error('Please detect GPS location or enter an address (min 4 characters)');
+      }
+
       const reporterName =
         userProfile?.displayName ||
         currentUser.displayName ||

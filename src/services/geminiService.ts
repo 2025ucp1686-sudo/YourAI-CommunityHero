@@ -33,6 +33,13 @@ function handleGeminiError(error: any, context: string): void {
   console.warn(`[Gemini] Error in ${context}:`, msg.substring(0, 120));
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMsg: string): Promise<T> {
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(errorMsg)), timeoutMs)
+  );
+  return Promise.race([promise, timeout]);
+}
+
 // ─── Default fallback analysis (used when Gemini is unavailable) ──────────────
 const DEFAULT_ANALYSIS: GeminiAnalysis = {
   category: 'other' as IssueCategory,
@@ -58,6 +65,59 @@ async function fileToGenerativePart(file: File) {
   });
 }
 
+// Compress image using HTML5 canvas to keep size small (under 200KB)
+async function compressImageForGemini(file: File): Promise<Blob | File> {
+  if (!file.type.startsWith('image/')) return file;
+
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        const MAX_WIDTH = 1000;
+        const MAX_HEIGHT = 1000;
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        canvas.toBlob(
+          (blob) => {
+            if (blob) {
+              resolve(blob);
+            } else {
+              resolve(file);
+            }
+          },
+          'image/jpeg',
+          0.7
+        );
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
+  });
+}
+
 // Parse JSON safely from Gemini text response
 function parseJsonFromText<T>(text: string, fallback: T): T {
   try {
@@ -77,7 +137,10 @@ export async function analyzeIssueMedia(file: File): Promise<GeminiAnalysis> {
   if (!isGeminiReady() || !geminiVision) return DEFAULT_ANALYSIS;
 
   try {
-    const mediaPart = await fileToGenerativePart(file);
+    console.log('[Gemini] Compressing image before AI analysis...');
+    const compressed = await compressImageForGemini(file).catch(() => file);
+    console.log('[Gemini] Base64 conversion...');
+    const mediaPart = await fileToGenerativePart(compressed as File);
 
     const prompt = `You are a civic issue detection AI for a community engagement platform.
 Analyze this image and identify any civic or infrastructure issues visible.
@@ -96,7 +159,8 @@ Respond ONLY with valid JSON in this exact format (no markdown, no extra text):
 
 Severity guide: low=minor inconvenience, medium=affects daily life, high=safety risk, critical=immediate danger`;
 
-    const result = await geminiVision.generateContent([prompt, mediaPart]);
+    const apiCall = geminiVision.generateContent([prompt, mediaPart]);
+    const result = await withTimeout(apiCall, 15000, 'Gemini media analysis timed out after 15s');
     const text = result.response.text();
     const analysis = parseJsonFromText<GeminiAnalysis>(text, DEFAULT_ANALYSIS);
 
@@ -134,7 +198,8 @@ export async function generateIssueSummary(
 Keep it factual and under 80 words. No bullet points, just plain text.`;
 
   try {
-    const result = await geminiPro.generateContent(prompt);
+    const apiCall = geminiPro.generateContent(prompt);
+    const result = await withTimeout(apiCall, 15000, 'Gemini issue summary timed out after 15s');
     return result.response.text().trim();
   } catch (error: any) {
     handleGeminiError(error, 'generateIssueSummary');
@@ -167,7 +232,8 @@ ${existingSummary}
 Respond ONLY with JSON: {"isDuplicate": false, "duplicateId": null, "confidence": 0.0}`;
 
   try {
-    const result = await geminiPro.generateContent(prompt);
+    const apiCall = geminiPro.generateContent(prompt);
+    const result = await withTimeout(apiCall, 15000, 'Gemini duplicate detection timed out after 15s');
     return parseJsonFromText(result.response.text(), { isDuplicate: false, confidence: 0 });
   } catch (error: any) {
     handleGeminiError(error, 'detectDuplicates');
@@ -218,7 +284,8 @@ Respond ONLY with JSON:
 }`;
 
   try {
-    const result = await geminiPro.generateContent(prompt);
+    const apiCall = geminiPro.generateContent(prompt);
+    const result = await withTimeout(apiCall, 15000, 'Gemini predictive insights timed out after 15s');
     const parsed = parseJsonFromText<Partial<PredictiveInsight>>(result.response.text(), {});
     return { ...fallback, ...parsed, id: `insight-${Date.now()}`, generatedAt: new Date() };
   } catch (error: any) {
@@ -272,7 +339,8 @@ Respond ONLY with JSON:
 {"category": "pothole|water_leakage|garbage|streetlight|drainage|road_damage|infrastructure|other", "severity": "low|medium|high|critical", "tags": ["tag1"]}`;
 
   try {
-    const result = await geminiPro.generateContent(prompt);
+    const apiCall = geminiPro.generateContent(prompt);
+    const result = await withTimeout(apiCall, 15000, 'Gemini text classification timed out after 15s');
     return parseJsonFromText(result.response.text(), fallback);
   } catch (error: any) {
     handleGeminiError(error, 'categorizeFromText');

@@ -15,35 +15,120 @@ import {
   Timestamp,
   QueryConstraint,
 } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { db, storage } from '@/lib/firebase';
+import { db } from '@/lib/firebase';
 import type { Issue, IssueCategory, IssueSeverity, IssueStatus, GeoLocation, GeminiAnalysis } from '@/types';
 import { v4 as uuidv4 } from 'uuid';
 
 const ISSUES_COLLECTION = 'issues';
 
-// ─── Upload media files (with 10s timeout per file) ────────────────────────────
-export async function uploadIssueMedia(files: File[], userId: string): Promise<string[]> {
+// ─── Compress image using HTML5 canvas to keep size under 200KB ───────────────
+export async function compressImage(file: File): Promise<Blob | File> {
+  if (!file.type.startsWith('image/')) return file;
+
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        const MAX_WIDTH = 1200;
+        const MAX_HEIGHT = 1200;
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, width, height);
+        canvas.toBlob(
+          (blob) => {
+            if (blob) {
+              resolve(blob);
+            } else {
+              resolve(file);
+            }
+          },
+          'image/jpeg',
+          0.7
+        );
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target?.result as string;
+    };
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
+  });
+}
+
+// ─── Upload media files to Cloudinary (with 10s timeout per file) ───────────────
+export async function uploadToCloudinary(file: File): Promise<string> {
+  const cloudName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME || 'dtipnlwoc';
+  const preset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET || 'community_reports';
+  const uploadUrl = import.meta.env.VITE_CLOUDINARY_UPLOAD_URL || `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
+
+  let fileToUpload: Blob | File = file;
+  try {
+    if (file.type.startsWith('image/')) {
+      console.log('[issueService] Compressing image before Cloudinary upload:', file.name);
+      fileToUpload = await compressImage(file);
+      console.log('[issueService] Compression successful, new size:', fileToUpload.size);
+    }
+  } catch (e) {
+    console.warn('[issueService] Image compression failed, uploading original:', e);
+  }
+
+  const formData = new FormData();
+  formData.append('file', fileToUpload, file.name);
+  formData.append('upload_preset', preset);
+
+  const uploadTimeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('Cloudinary upload timeout after 10s')), 10000)
+  );
+
+  const uploadPromise = fetch(uploadUrl, {
+    method: 'POST',
+    body: formData,
+  }).then(async (res) => {
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Cloudinary upload failed: ${res.status} ${res.statusText} - ${errText}`);
+    }
+    const data = await res.json();
+    if (!data.secure_url) {
+      throw new Error('Cloudinary upload response missing secure_url');
+    }
+    return data.secure_url as string;
+  });
+
+  return Promise.race([uploadPromise, uploadTimeout]);
+}
+
+export async function uploadIssueMedia(files: File[], _userId: string): Promise<string[]> {
   const urls: string[] = [];
 
   for (const file of files) {
     try {
-      const fileRef = ref(storage, `issues/${userId}/${uuidv4()}-${file.name}`);
-
-      // Wrap each upload in a 10-second timeout using Promise.race
-      // This prevents the promise from hanging forever on CORS/network failures
-      const uploadTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Upload timeout after 10s')), 10000)
-      );
-
-      const uploadPromise = uploadBytes(fileRef, file).then(() => getDownloadURL(fileRef));
-
-      const url = await Promise.race([uploadPromise, uploadTimeout]);
+      console.log('[issueService] Uploading file to Cloudinary:', file.name);
+      const url = await uploadToCloudinary(file);
       urls.push(url);
-      console.log('[issueService] Uploaded file:', file.name, '->', url.substring(0, 60) + '...');
+      console.log('[issueService] Cloudinary upload success:', file.name, '->', url);
     } catch (err: any) {
       // Log but never throw — let submission continue without this file
-      console.warn('[issueService] File upload failed (non-blocking):', file.name, err?.message || err);
+      console.warn('[issueService] Cloudinary upload failed (non-blocking):', file.name, err?.message || err);
     }
   }
 
@@ -69,15 +154,33 @@ export async function createIssue(data: {
   console.log('[issueService] Report data:', { title: data.title, category: data.category, severity: data.severity, reportedBy: data.reportedBy });
 
   try {
+    const imageUrl = data.mediaUrls.length > 0 ? data.mediaUrls[0] : null;
+
     // NOTE: serverTimestamp() CANNOT be used inside arrays in Firestore.
     // Use ISO string for statusHistory timestamps.
     const issueRef = await addDoc(collection(db, ISSUES_COLLECTION), {
-      ...data,
-      // Strip undefined values that Firestore rejects
+      title: data.title,
+      description: data.description,
+      category: data.category,
+      severity: data.severity,
+      imageUrl: imageUrl, // Cloudinary image URL (or null)
+      location: data.location,
+      lat: data.location.lat,
+      lng: data.location.lng,
+      status: 'reported' as IssueStatus,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      createdBy: data.reportedBy,
+      reward: 50, // 50 points earned
+      verificationCount: 0,
+      reporterName: data.reporterName,
+      reporterUid: data.reportedBy,
+      
+      // Keep other existing fields for frontend backwards-compatibility
+      mediaUrls: data.mediaUrls,
+      mediaTypes: data.mediaTypes,
       reporterAvatar: data.reporterAvatar || null,
       geminiAnalysis: data.geminiAnalysis || null,
-      status: 'reported' as IssueStatus,
-      verificationCount: 0,
       upvoteCount: 0,
       statusHistory: [{
         status: 'reported',
@@ -85,8 +188,6 @@ export async function createIssue(data: {
         note: 'Issue reported by citizen',
       }],
       comments: [],
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
     });
     console.log('[issueService] Firestore write success! Document ID:', issueRef.id);
     return issueRef.id;

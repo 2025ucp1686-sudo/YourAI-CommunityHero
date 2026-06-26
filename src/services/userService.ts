@@ -2,8 +2,7 @@ import {
   collection, doc, setDoc, getDoc, updateDoc, getDocs,
   query, orderBy, limit, serverTimestamp, where
 } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
-import { db, storage } from '@/lib/firebase';
+import { db } from '@/lib/firebase';
 import type { User, UserBadge } from '@/types';
 
 // Badge thresholds
@@ -61,11 +60,29 @@ export async function addPoints(userId: string, points: number, action: string):
   await updateDoc(userRef, updates as Record<string, any>);
 }
 
-// ─── Upload profile photo ─────────────────────────────────────────────────────
+// ─── Upload profile photo (using Cloudinary) ──────────────────────────────────
 export async function uploadProfilePhoto(userId: string, file: File): Promise<string> {
-  const photoRef = ref(storage, `profiles/${userId}/avatar.${file.name.split('.').pop()}`);
-  await uploadBytes(photoRef, file);
-  return getDownloadURL(photoRef);
+  const cloudName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME || 'dtipnlwoc';
+  const preset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET || 'community_reports';
+  const uploadUrl = import.meta.env.VITE_CLOUDINARY_UPLOAD_URL || `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`;
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('upload_preset', preset);
+  formData.append('public_id', `profile_${userId}`);
+
+  const res = await fetch(uploadUrl, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Profile photo upload failed: ${res.statusText} - ${errText}`);
+  }
+
+  const data = await res.json();
+  return data.secure_url;
 }
 
 // ─── Get leaderboard ──────────────────────────────────────────────────────────
